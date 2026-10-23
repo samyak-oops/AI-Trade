@@ -229,21 +229,29 @@ def compute_confidence(
         "agent_track_record":    round(s_track, 3),
     }
 
-    # Weighted score (0–100)
-    raw = (
-        s_confluence * weights.get("indicator_confluence", 0.25)
-        + s_mtf       * weights.get("multi_timeframe",       0.15)
-        + s_backtest  * weights.get("backtest_edge",         0.25)
-        + s_regime    * weights.get("market_regime",         0.10)
-        + s_liquidity * weights.get("liquidity_quality",     0.05)
-        + s_fundam    * weights.get("fundamentals_news",     0.10)
-        + s_track     * weights.get("agent_track_record",    0.10)
+    n_signals = past_signal_stats.get("total", 0) if past_signal_stats else 0
+    include_track_record = n_signals >= 50
+
+    active_weights = dict(weights)
+    if not include_track_record:
+        # Exclude agent_track_record and renormalize remaining weights
+        active_weights.pop("agent_track_record", None)
+        total_w = sum(active_weights.values())
+        if total_w > 0:
+            active_weights = {k: v / total_w for k, v in active_weights.items()}
+
+    # Weighted score (0–100) using normalized active weights
+    raw = sum(
+        report.raw_subscores[k] * active_weights.get(k, 0)
+        for k in active_weights
     )
     report.score = round(raw * 100, 1)
     report.breakdown = {
-        k: round(v * weights.get(k, 0) * 100, 1)
-        for k, v in report.raw_subscores.items()
+        k: round(report.raw_subscores[k] * active_weights.get(k, 0) * 100, 1)
+        for k in active_weights
     }
+    if not include_track_record:
+        report.breakdown["agent_track_record (excluded <50 signals)"] = 0.0
 
     # ── Hard rules ────────────────────────────────────────────────────────────
     if setup.risk_reward < 2.0:
@@ -272,12 +280,12 @@ def compute_confidence(
         elif sub > 0.7:
             report.reasons_high.append(f"{label}: {sub:.0%}")
 
-    # ── Calibration placeholder ───────────────────────────────────────────────
-    n_signals = past_signal_stats.get("total", 0)
-    if n_signals < 20:
+    # ── Calibration (Requires >= 50 logged signals) ───────────────────────────
+    if n_signals < 50:
         report.is_calibrated = False
+        report.calibrated_score = None
     else:
         report.is_calibrated = True
-        report.calibrated_score = report.score  # overwrite with isotonic result
+        report.calibrated_score = report.score
 
     return report

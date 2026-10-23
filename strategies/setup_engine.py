@@ -41,6 +41,9 @@ class TradeSetup:
     pivots: Dict[str, float] = field(default_factory=dict)
     score_factors: Dict[str, float] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    regime: str = "UNKNOWN"                 # "TREND" | "RANGE" | "TRANSITIONAL"
+    families_triggered: List[str] = field(default_factory=list)
+    eligible_instrument: str = "DELIVERY"   # "DELIVERY" | "INTRADAY_OR_FNO"
 
     def is_valid(self) -> bool:
         return (
@@ -176,8 +179,9 @@ def analyze_setup(
             bearish_triggers.append("Supertrend Bearish")
     score_factors["supertrend"] = st_score
 
-    # ── 6. Breakout (Donchian / 52-wk high) ──────────────────────────────────
+    # ── 6. Breakout (Donchian / 52-wk high & low) ───────────────────────────
     d_high = last.get("Donchian_high")
+    d_low = last.get("Donchian_low")
     vol_ratio = last.get("Volume_ratio")
     vol_surge = cfg.get("volume_surge_multiplier", 1.5)
     breakout_score = 0.0
@@ -186,6 +190,11 @@ def analyze_setup(
             direction_votes["BUY"] += 3
             breakout_score = 1.0
             bullish_triggers.append(f"52-Wk High Breakout (Vol ratio={vol_ratio:.1f}x)")
+    if d_low and not np.isnan(d_low):
+        if price <= d_low and vol_ratio and vol_ratio >= vol_surge:
+            direction_votes["SELL"] += 3
+            breakout_score = 1.0
+            bearish_triggers.append(f"52-Wk Low Breakdown (Vol ratio={vol_ratio:.1f}x)")
     score_factors["breakout"] = breakout_score
 
     # ── 7. Bollinger Bands mean reversion ─────────────────────────────────────
@@ -203,18 +212,75 @@ def analyze_setup(
             bearish_triggers.append("BB + RSI Overbought Reversal")
     score_factors["bollinger"] = bb_score
 
-    # ── Determine direction ───────────────────────────────────────────────────
-    buy_votes = direction_votes["BUY"]
-    sell_votes = direction_votes["SELL"]
-    if buy_votes == sell_votes or (buy_votes < 4 and sell_votes < 4):
-        direction = "NO_SIGNAL"
-        strategies_triggered = []
-    elif buy_votes > sell_votes:
+    # ── Regime Determination (ADX 14) ─────────────────────────────────────────
+    adx_val = float(adx) if adx is not None and not np.isnan(adx) else 20.0
+    if adx_val > 25:
+        detected_regime = "TREND"
+    elif adx_val < 20:
+        detected_regime = "RANGE"
+    else:
+        detected_regime = "TRANSITIONAL"
+
+    # ── Signal Families (count each family once) ──────────────────────────────
+    # Families: 'Trend', 'Momentum/Breakout', 'Mean-Reversion'
+    bullish_families: List[str] = []
+    bearish_families: List[str] = []
+
+    # Trend family: EMA, Supertrend, MACD
+    if any(k in " ".join(bullish_triggers) for k in ["EMA", "Supertrend", "MACD"]):
+        bullish_families.append("Trend Family (EMA/Supertrend/MACD)")
+    if any(k in " ".join(bearish_triggers) for k in ["EMA", "Supertrend", "MACD"]):
+        bearish_families.append("Trend Family (EMA/Supertrend/MACD)")
+
+    # Momentum/Breakout family: 52-wk high/low breakout with volume
+    if any("52-Wk High Breakout" in t for t in bullish_triggers):
+        bullish_families.append("Momentum/Breakout Family (52-Wk High)")
+    if any("52-Wk Low Breakdown" in t for t in bearish_triggers):
+        bearish_families.append("Momentum/Breakout Family (52-Wk Low)")
+
+    # Mean-Reversion family: RSI, Bollinger
+    if any(k in " ".join(bullish_triggers) for k in ["Oversold", "BB + RSI"]):
+        bullish_families.append("Mean-Reversion Family (RSI/Bollinger)")
+    if any(k in " ".join(bearish_triggers) for k in ["Overbought", "BB + RSI"]):
+        bearish_families.append("Mean-Reversion Family (RSI/Bollinger)")
+
+    # Filter families by regime
+    # Trend regime: only Trend & Breakout setups eligible
+    # Range regime: only Mean-Reversion setups eligible
+    eligible_bullish_families = [
+        f for f in bullish_families
+        if (detected_regime == "TREND" and "Mean-Reversion" not in f)
+        or (detected_regime == "RANGE" and "Mean-Reversion" in f)
+        or (detected_regime == "TRANSITIONAL")
+    ]
+    eligible_bearish_families = [
+        f for f in bearish_families
+        if (detected_regime == "TREND" and "Mean-Reversion" not in f)
+        or (detected_regime == "RANGE" and "Mean-Reversion" in f)
+        or (detected_regime == "TRANSITIONAL")
+    ]
+
+    # Require agreement from at least 2 independent families in allowed regime
+    regime_warnings: List[str] = []
+    if detected_regime == "TRANSITIONAL":
+        regime_warnings.append(f"Regime is Transitional (ADX={adx_val:.1f} is between 20-25) – higher uncertainty.")
+
+    if len(eligible_bullish_families) >= 2 and len(eligible_bullish_families) > len(eligible_bearish_families):
         direction = "BUY"
         strategies_triggered = bullish_triggers + neutral_triggers
-    else:
+        active_families = eligible_bullish_families
+        instrument = "DELIVERY"
+    elif len(eligible_bearish_families) >= 2 and len(eligible_bearish_families) > len(eligible_bullish_families):
         direction = "SELL"
         strategies_triggered = bearish_triggers + neutral_triggers
+        active_families = eligible_bearish_families
+        instrument = "INTRADAY_OR_FNO"
+        regime_warnings.append("SELL/Short setup: Equity cash delivery short is prohibited by SEBI; execute as Intraday MIS or F&O only.")
+    else:
+        direction = "NO_SIGNAL"
+        strategies_triggered = []
+        active_families = []
+        instrument = "DELIVERY"
 
     # ── ATR-based stop-loss & targets ───────────────────────────────────────
     atr = float(last.get("ATR", 0) or 0)
@@ -283,5 +349,8 @@ def analyze_setup(
         candlestick_patterns=patterns,
         pivots=pivots,
         score_factors=score_factors,
-        warnings=warnings,
+        warnings=regime_warnings + warnings,
+        regime=detected_regime,
+        families_triggered=active_families,
+        eligible_instrument=instrument,
     )

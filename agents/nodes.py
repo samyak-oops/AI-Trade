@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from agents.llm_provider import get_llm
 from agents.prompts import (
     EQUITY_RESEARCH_ANALYST_PROMPT,
+    EXPLAINER_RISK_REVIEWER_SYSTEM_PROMPT,
     QUANT_INTRADAY_SYSTEM_PROMPT,
     TECHNICAL_ANALYSIS_SPECIALIST_PROMPT,
 )
@@ -272,13 +273,13 @@ async def confidence_node(state: AgentState) -> Dict[str, Any]:
 
 # ── 10. Risk Manager Node ─────────────────────────────────────────────────────
 async def risk_manager_node(state: AgentState) -> Dict[str, Any]:
-    """Compute position size based on ATR stop and 1% capital risk."""
+    """Compute position size based on ATR stop, 1% capital risk, 20% max position value, and India VIX."""
     setup = state.get("trade_setup")
     capital = state.get("capital", 100_000.0)
     from core.config import get_settings
     risk_pct = get_settings().risk_per_trade_pct / 100
 
-    if setup is None or setup.entry_price == 0 or setup.stop_loss == 0:
+    if setup is None or setup.entry_price == 0 or setup.stop_loss == 0 or setup.direction == "NO_SIGNAL":
         return {"position_size": 0.0}
 
     risk_per_share = abs(setup.entry_price - setup.stop_loss)
@@ -287,6 +288,25 @@ async def risk_manager_node(state: AgentState) -> Dict[str, Any]:
 
     capital_at_risk = capital * risk_pct
     shares = int(capital_at_risk / risk_per_share)
+
+    # 1. Cap position value at max 20% of capital
+    max_value_shares = int((capital * 0.20) / setup.entry_price)
+    shares = min(shares, max_value_shares)
+
+    # 2. Volatility bands (India VIX scaling)
+    # <13 low, 13-18 normal, 18-24 elevated (reduce by 50%), >24 high (no new positions)
+    vix_dict = state.get("market_data", {}).get("vix", {})
+    vix = vix_dict.get("price") or vix_dict.get("vix")
+    if vix is not None:
+        try:
+            vix_val = float(vix)
+            if vix_val > 24.0:
+                shares = 0
+            elif vix_val >= 18.0:
+                shares = int(shares * 0.5)
+        except (ValueError, TypeError):
+            pass
+
     return {"position_size": float(shares)}
 
 
@@ -323,6 +343,9 @@ Vision analysis: {state.get('vision_analysis', {})}
 Trade Setup:
   Direction: {setup.direction}
   Timeframe: {setup.timeframe}
+  Detected Regime: {setup.regime}
+  Eligible Instrument: {setup.eligible_instrument}
+  Signal Families Triggered: {', '.join(setup.families_triggered) if setup.families_triggered else 'None'}
   Entry: ₹{setup.entry_price:.2f}
   Stop-Loss: ₹{setup.stop_loss:.2f}
   Target 1: ₹{setup.target1:.2f}
@@ -334,12 +357,15 @@ Trade Setup:
   Warnings: {'; '.join(setup.warnings)}
 """
     if report:
+        calib_txt = "Calibrated" if report.is_calibrated else "Uncalibrated (requires ≥50 logged signals)"
         ctx += f"""
 Confidence Score: {report.score:.1f}% ({'PASS ✅' if report.passed_gate() else 'FAIL ❌ (HARD GATE)'})
+Calibration Status: {calib_txt}
 Breakdown: {report.breakdown}
 Hard rule failures: {report.hard_rule_failures}
 Low scoring factors: {report.reasons_low}
 High scoring factors: {report.reasons_high}
+Report Timestamp: {report.timestamp}
 """
     if bt:
         ctx += f"""
@@ -381,20 +407,26 @@ Fundamentals:
     if is_fundamental_query:
         base_prompt = EQUITY_RESEARCH_ANALYST_PROMPT
     else:
-        base_prompt = QUANT_INTRADAY_SYSTEM_PROMPT + "\n\n" + TECHNICAL_ANALYSIS_SPECIALIST_PROMPT
+        base_prompt = EXPLAINER_RISK_REVIEWER_SYSTEM_PROMPT
 
     system_prompt = f"""{base_prompt}
 
-# LIVE PIPELINE INTEGRATION INSTRUCTIONS:
-- You must base all analysis strictly on the pre-computed verified data provided below. Never fabricate prices, levels, or indicators.
-- System Confidence Threshold: {THRESHOLD}%.
-- If confidence score <= {THRESHOLD}% or any hard rule has failed, your decision MUST be NO_TRADE (or WAIT) as per the decision rules.
-- Maintain transparency, explain bullish and bearish evidence, conflicting signals, and material limitations.
-- Always conclude with the SEBI educational compliance disclaimer."""
+# ENGINE DETERMINISTIC DATA VERIFICATION:
+- You must report exactly what the deterministic engine calculated below. Do NOT compute, alter, or round differently.
+- Hard Threshold: {THRESHOLD}%.
+- If report.passed_gate() is False or setup.direction is NO_SIGNAL, your Decision in section 1 MUST be NO-TRADE (or WATCH).
+- Strictly adhere to the 6-part OUTPUT FORMAT:
+  1) Decision: TRADE / NO-TRADE / WATCH
+  2) Regime summary (with data timestamps and sources)
+  3) Setup: signal families that agree, instrument, entry, stop, T1, T2, size (shares or lots), R:R after costs
+  4) Pillar scores and total score as reported by the engine
+  5) Risks and what would invalidate the setup
+  6) Data gaps or assumptions
+- Conclude with: 'Not investment advice. Paper-trade first.'"""
 
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=f"User query: {state.get('user_query', '')}\n\nAnalysis data:\n{ctx}"),
+        HumanMessage(content=f"User query: {state.get('user_query', '')}\n\nDeterministic Engine Output:\n{ctx}"),
     ]
 
     # Streaming synthesis
@@ -409,13 +441,16 @@ Fundamentals:
 
     # Force NO TRADE if gate failed
     if report and not report.passed_gate():
-        if "NO TRADE" not in response_text[:200].upper():
+        if "NO-TRADE" not in response_text[:200].upper() and "NO TRADE" not in response_text[:200].upper():
             response_text = (
-                f"## 🚫 NO TRADE\n\n"
-                f"**Confidence: {report.score}% (Required: >{THRESHOLD}%)**\n\n"
-                f"Hard rule failures: {'; '.join(report.hard_rule_failures) if report.hard_rule_failures else 'Score below threshold'}\n\n"
+                f"### 1) Decision: NO-TRADE\n\n"
+                f"**Confidence Gate: {report.score}% (Threshold: >{THRESHOLD}%)**\n\n"
+                f"**Hard Rule Failures:** {'; '.join(report.hard_rule_failures) if report.hard_rule_failures else 'Confidence score below threshold'}\n\n"
                 + response_text
             )
+
+    if "Not investment advice. Paper-trade first." not in response_text:
+        response_text += "\n\n---\n*Not investment advice. Paper-trade first.*"
 
     return {
         "final_response": response_text,
